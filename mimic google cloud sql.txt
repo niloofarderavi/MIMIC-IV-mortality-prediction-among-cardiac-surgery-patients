@@ -1,0 +1,182 @@
+WITH cardiac_surgery_patients AS (
+    -- Identify cardiac surgery patients
+    SELECT DISTINCT 
+        a.subject_id,
+        a.hadm_id,
+        a.admittime,
+        a.dischtime,
+        a.hospital_expire_flag,
+        a.deathtime AS in_hospital_deathtime,  -- In-hospital death time
+        p.dod AS death_date  -- Overall death date (in or out of hospital)
+    FROM `physionet-data.mimiciv_3_1_hosp.admissions` a
+    INNER JOIN `physionet-data.mimiciv_3_1_hosp.procedures_icd` pr
+        ON a.hadm_id = pr.hadm_id
+    LEFT JOIN `physionet-data.mimiciv_3_1_hosp.patients` p
+        ON a.subject_id = p.subject_id
+    WHERE 
+        -- Cardiac surgery ICD-10-PCS codes
+        (pr.icd_code LIKE '021%'  -- CABG
+         OR pr.icd_code LIKE '02R%'  -- Valve replacement/repair
+         OR pr.icd_code LIKE '025%'  -- Percutaneous cardiovascular
+         OR pr.icd_code LIKE '027%'  -- Coronary artery dilation
+         OR pr.icd_code LIKE '02Q%'  -- Heart repair
+        )
+),
+creatinine_baseline AS (
+    SELECT le.subject_id AS subject_id, le.hadm_id AS hadm_id, MIN(le.valuenum) AS baseline_creatinine
+    FROM `physionet-data.mimiciv_3_1_hosp.labevents` le
+    WHERE le.itemid IN (50912, 50976) -- Creatinine
+    GROUP BY le.subject_id, le.hadm_id
+),
+creatinine_followup AS (
+    SELECT le.subject_id AS subject_id, le.hadm_id AS hadm_id, MAX(le.valuenum) AS max_creatinine
+    FROM `physionet-data.mimiciv_3_1_hosp.labevents` le
+    WHERE le.itemid IN (50912, 50976)
+    GROUP BY le.subject_id, le.hadm_id
+),
+aki_status AS (
+    SELECT cb.subject_id AS subject_id, cb.hadm_id AS hadm_id, cb.baseline_creatinine, cf.max_creatinine,
+           CASE 
+               WHEN cf.max_creatinine >= cb.baseline_creatinine * 1.5 THEN 'Positive'
+               WHEN cf.max_creatinine - cb.baseline_creatinine >= 0.3 THEN 'Positive'
+               ELSE 'Negative'
+           END AS aki_label,
+           CASE 
+               WHEN cf.max_creatinine >= cb.baseline_creatinine * 3 OR cf.max_creatinine >= 4.0 THEN '3'
+               WHEN cf.max_creatinine >= cb.baseline_creatinine * 2 THEN '2'
+               WHEN cf.max_creatinine >= cb.baseline_creatinine * 1.5 OR cf.max_creatinine - cb.baseline_creatinine >= 0.3 THEN '1'
+               ELSE '0'
+           END AS kdigo_grade
+    FROM creatinine_baseline cb
+    JOIN creatinine_followup cf ON cb.hadm_id = cf.hadm_id AND cb.subject_id = cf.subject_id
+),
+bmi_data AS (
+    SELECT ce.hadm_id AS hadm_id, 
+           MAX(CASE WHEN ce.itemid = 226512 THEN ce.valuenum END) AS weight,
+           MAX(CASE WHEN ce.itemid = 226730 THEN ce.valuenum END) AS height
+    FROM `physionet-data.mimiciv_3_1_icu.chartevents` ce
+    WHERE ce.hadm_id IN (SELECT hadm_id FROM cardiac_surgery_patients)
+    GROUP BY ce.hadm_id
+),
+vital_signs AS (
+    SELECT ce.hadm_id AS hadm_id,
+           MAX(CASE WHEN ce.itemid = 220045 THEN ce.valuenum END) AS heart_rate,
+           MAX(CASE WHEN ce.itemid = 220179 THEN ce.valuenum END) AS sbp,
+           MAX(CASE WHEN ce.itemid = 220180 THEN ce.valuenum END) AS dbp,
+           MAX(CASE WHEN ce.itemid = 220210 THEN ce.valuenum END) AS rr,
+           MAX(CASE WHEN ce.itemid = 223761 THEN ce.valuenum END) AS temperature,
+           MAX(CASE WHEN ce.itemid = 220277 THEN ce.valuenum END) AS spo2
+    FROM `physionet-data.mimiciv_3_1_icu.chartevents` ce
+    WHERE ce.hadm_id IN (SELECT hadm_id FROM cardiac_surgery_patients)
+    GROUP BY ce.hadm_id
+),
+comorbidities AS (
+    SELECT di.hadm_id AS hadm_id,
+           MAX(CASE WHEN di.icd_code LIKE 'I50%' THEN 1 ELSE 0 END) AS chf,
+           MAX(CASE WHEN di.icd_code LIKE 'I48%' THEN 1 ELSE 0 END) AS cardiac_arrhythmias,
+           MAX(CASE WHEN di.icd_code LIKE 'I35%' THEN 1 ELSE 0 END) AS valvular_disease,
+           MAX(CASE WHEN di.icd_code LIKE 'K70%' OR di.icd_code LIKE 'K74%' THEN 1 ELSE 0 END) AS liver_disease,
+           MAX(CASE WHEN di.icd_code LIKE 'I10%' THEN 1 ELSE 0 END) AS hypertension,
+           MAX(CASE WHEN di.icd_code LIKE 'I27%' THEN 1 ELSE 0 END) AS pulmonary_circulation_disorder,
+           MAX(CASE WHEN di.icd_code LIKE 'I73%' THEN 1 ELSE 0 END) AS peripheral_vascular_disorder,
+           MAX(CASE WHEN di.icd_code LIKE 'J44%' THEN 1 ELSE 0 END) AS chronic_pulmonary_disease,
+           MAX(CASE WHEN di.icd_code LIKE 'E11%' THEN 1 ELSE 0 END) AS uncomplicated_diabetes,
+           MAX(CASE WHEN di.icd_code LIKE 'E10%' OR di.icd_code LIKE 'E13%' THEN 1 ELSE 0 END) AS complicated_diabetes
+    FROM `physionet-data.mimiciv_3_1_hosp.diagnoses_icd` di
+    WHERE di.hadm_id IN (SELECT hadm_id FROM cardiac_surgery_patients)
+    GROUP BY di.hadm_id
+),
+lab_values AS (
+    SELECT le.hadm_id AS hadm_id,
+           MAX(CASE WHEN le.itemid = 51300 THEN le.valuenum END) AS wbc,
+           MAX(CASE WHEN le.itemid = 51265 THEN le.valuenum END) AS platelets,
+           MAX(CASE WHEN le.itemid = 50931 THEN le.valuenum END) AS glucose,
+           MAX(CASE WHEN le.itemid = 50983 THEN le.valuenum END) AS sodium,
+           MAX(CASE WHEN le.itemid = 50971 THEN le.valuenum END) AS potassium,
+           MAX(CASE WHEN le.itemid IN (50912, 50976) THEN le.valuenum END) AS serum_creatinine
+    FROM `physionet-data.mimiciv_3_1_hosp.labevents` le
+    WHERE le.hadm_id IN (SELECT hadm_id FROM cardiac_surgery_patients)
+    GROUP BY le.hadm_id
+),
+outcomes AS (
+    SELECT 
+        csp.hadm_id AS hadm_id,
+        csp.hospital_expire_flag AS hospital_expire_flag,
+        CASE 
+            WHEN csp.hospital_expire_flag = 1 
+                 OR (csp.in_hospital_deathtime IS NOT NULL AND DATE_DIFF(csp.in_hospital_deathtime, csp.admittime, DAY) <= 30)
+                 OR (csp.death_date IS NOT NULL AND DATE_DIFF(csp.death_date, csp.admittime, DAY) <= 30)
+            THEN 1 
+            ELSE 0 
+        END AS mortality_30d,
+        CASE 
+            WHEN csp.hospital_expire_flag = 1 
+                 OR (csp.in_hospital_deathtime IS NOT NULL AND DATE_DIFF(csp.in_hospital_deathtime, csp.admittime, DAY) <= 90)
+                 OR (csp.death_date IS NOT NULL AND DATE_DIFF(csp.death_date, csp.admittime, DAY) <= 90)
+            THEN 1 
+            ELSE 0 
+        END AS mortality_90d,
+        ROUND(MAX(icu.los), 2) AS icu_los
+    FROM cardiac_surgery_patients csp
+    LEFT JOIN `physionet-data.mimiciv_3_1_icu.icustays` icu ON csp.hadm_id = icu.hadm_id
+    GROUP BY csp.hadm_id, csp.hospital_expire_flag, csp.in_hospital_deathtime, csp.death_date, csp.admittime
+),
+patient_demographics AS (
+    SELECT 
+        p.subject_id AS subject_id,
+        a.hadm_id AS hadm_id,
+        p.anchor_age + (EXTRACT(YEAR FROM a.admittime) - p.anchor_year) AS age,
+        CASE WHEN p.gender = 'M' THEN 1 ELSE 0 END AS male
+    FROM `physionet-data.mimiciv_3_1_hosp.patients` p
+    JOIN `physionet-data.mimiciv_3_1_hosp.admissions` a 
+        ON p.subject_id = a.subject_id
+    WHERE a.hadm_id IN (SELECT hadm_id FROM cardiac_surgery_patients)
+)
+SELECT 
+    sp.subject_id AS subject_id,
+    sp.hadm_id AS hadm_id,
+    sp.stay_id AS stay_id,
+    pd.age AS age,
+    pd.male AS male,
+    v.heart_rate AS heart_rate,
+    v.sbp AS sbp,
+    v.dbp AS dbp,
+    v.rr AS rr,
+    v.temperature AS temperature,
+    v.spo2 AS spo2,
+    lv.wbc AS wbc,
+    lv.platelets AS platelets,
+    lv.glucose AS glucose,
+    lv.sodium AS sodium,
+    lv.potassium AS potassium,
+    lv.serum_creatinine AS serum_creatinine,
+    b.weight AS weight,
+    b.height AS height,
+    c.chf AS chf,
+    c.cardiac_arrhythmias AS cardiac_arrhythmias,
+    c.valvular_disease AS valvular_disease,
+    c.liver_disease AS liver_disease,
+    c.hypertension AS hypertension,
+    c.pulmonary_circulation_disorder AS pulmonary_circulation_disorder,
+    c.peripheral_vascular_disorder AS peripheral_vascular_disorder,
+    c.chronic_pulmonary_disease AS chronic_pulmonary_disease,
+    c.uncomplicated_diabetes AS uncomplicated_diabetes,
+    c.complicated_diabetes AS complicated_diabetes,
+    o.hospital_expire_flag AS hospital_expire_flag,
+    o.mortality_30d AS mortality_30d,
+    o.mortality_90d AS mortality_90d,
+    o.icu_los AS icu_los,
+    a.aki_label AS aki_label,
+    a.kdigo_grade AS kdigo_grade
+FROM `physionet-data.mimiciv_3_1_icu.icustays` sp
+INNER JOIN cardiac_surgery_patients cp ON sp.hadm_id = cp.hadm_id
+LEFT JOIN vital_signs v ON sp.hadm_id = v.hadm_id
+LEFT JOIN lab_values lv ON sp.hadm_id = lv.hadm_id
+LEFT JOIN bmi_data b ON sp.hadm_id = b.hadm_id
+LEFT JOIN comorbidities c ON sp.hadm_id = c.hadm_id
+LEFT JOIN outcomes o ON sp.hadm_id = o.hadm_id
+LEFT JOIN aki_status a ON sp.hadm_id = a.hadm_id
+LEFT JOIN patient_demographics pd ON sp.hadm_id = pd.hadm_id
+ORDER BY sp.subject_id, sp.hadm_id;
+
+

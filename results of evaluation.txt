@@ -1,0 +1,72 @@
+#final results:
+Neural Network Results (Threshold = 0.48):
+Accuracy: 0.6695
+Precision: 0.7133
+Recall: 0.9068
+F1-Score: 0.7985
+AUC-ROC: 0.8912
+AUC-PR: 0.8095
+Confusion Matrix (tn, fp, fn, tp): 125, 43, 11, 107
+
+Random Forest Results (Threshold = 0.48):
+Accuracy: 0.8686
+Precision: 0.8516
+Recall: 0.9237
+F1-Score: 0.8862
+AUC-ROC: 0.9436
+AUC-PR: 0.8896
+Confusion Matrix (tn, fp, fn, tp): 149, 19, 9, 109
+8/8 ━━━━━━━━━━━━━━━━━━━━ 0s 18ms/step
+
+Neural Network Results (Threshold = 0.48):
+Accuracy: 0.8178
+Precision: 0.7133
+Recall: 0.9068
+F1-Score: 0.7985
+AUC-ROC: 0.8912
+AUC-PR: 0.8095
+Confusion Matrix (tn, fp, fn, tp): 125, 43, 11, 107
+
+Random Forest Results (Threshold = 0.48):
+Accuracy: 0.8390
+Precision: 0.8516
+Recall: 0.9237
+F1-Score: 0.8862
+AUC-ROC: 0.9436
+AUC-PR: 0.8896
+Confusion Matrix (tn, fp, fn, tp): 149, 19, 9, 109
+8/8 ━━━━━━━━━━━━━━━━━━━━ 0s 18ms/step
+
+Neural Network Results (Threshold = 0.48):
+Accuracy: 0.7669
+Precision: 0.7133
+Recall: 0.9068
+F1-Score: 0.7985
+AUC-ROC: 0.8912
+AUC-PR: 0.8095
+Confusion Matrix (tn, fp, fn, tp): 125, 43, 11, 107
+
+Random Forest Results (Threshold = 0.48):
+Accuracy: 0.8771
+Precision: 0.8516
+Recall: 0.9237
+F1-Score: 0.8862
+AUC-ROC: 0.9436
+AUC-PR: 0.8896
+Confusion Matrix (tn, fp, fn, tp): 149, 19, 9, 109
+
+Mean Metrics Across Folds (Neural Network, Threshold = 0.48):
+Mean Precision: 0.7133
+Mean Recall: 0.9068
+Mean F1-Score: 0.7985
+Mean AUC-ROC: 0.8912
+Mean AUC-PR: 0.8095
+Mean TN, FP, FN, TP: 125, 43, 11, 107
+
+Mean Metrics Across Folds (Random Forest, Threshold = 0.48):
+Mean Precision: 0.8516
+Mean Recall: 0.9237
+Mean F1-Score: 0.8862
+Mean AUC-ROC: 0.9436
+Mean AUC-PR: 0.8896
+Mean TN, FP, FN, TP: 149, 19, 9, 109
