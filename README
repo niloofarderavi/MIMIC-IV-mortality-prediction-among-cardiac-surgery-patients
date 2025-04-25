@@ -1,0 +1,59 @@
+Hospital Mortality Prediction with Deep Learning and Ensemble Methods
+This repository contains an advanced deep learning and machine learning project focused on predicting hospital mortality using patient data from the MIMIC-IV clinical database. The implementation uses a hybrid ensemble approach combining neural networks (deep learning), random forests, and XGBoost to achieve superior predictive performance.
+Overview
+The project extracts and processes data from MIMIC-IV to create engineered features capturing physiological relationships and medical risk factors. It implements advanced deep learning and traditional machine learning models, combining them in an optimized ensemble to maximize predictive accuracy.
+Features
+
+Data Pipeline: SQL queries extracting clinical data from MIMIC-IV
+Feature Engineering: Creation of medical indicators (shock index, mean arterial pressure, comorbidity indices)
+Models: Deep Learning (TensorFlow), Random Forest, XGBoost, and Hybrid ensemble
+Deep Learning Architecture: Multi-layer neural network with batch normalization, LeakyReLU activations, and dropout layers
+Threshold Tuning: Customized classification thresholds for each model
+Cross-validation: 3-fold stratified cross-validation
+Statistical Significance Testing: McNemar's test and paired t-tests
+
+Results
+ModelAccuracyPrecisionRecallF1-ScoreAUC-ROCAUC-PRDeep Learning0.63450.58700.97030.72940.79530.7665Random Forest0.81260.76230.90840.82890.90760.9051XGBoost0.79350.72710.93980.81990.90930.9035Hybrid0.81870.76980.90950.83380.91140.9069
+The Hybrid model outperformed all individual models across most metrics, with statistically significant improvements in AUC-ROC and F1-score. The optimal ensemble weights were approximately: Deep Learning: 30%, Random Forest: 45%, XGBoost: 25%.
+Technical Details
+
+Data Processing: Extraction of vital signs, lab values, comorbidities; AKI identification using KDIGO criteria; class balancing; feature standardization
+Deep Learning Architecture:
+
+Wide & Deep neural network with 4+ dense layers
+Batch normalization and LeakyReLU activations
+Dropout regularization (0.2-0.4)
+Custom focal loss function for imbalanced data
+
+
+Traditional ML Models:
+
+Random Forest: 500 trees with optimized parameters
+XGBoost: Custom hyperparameters with scale_pos_weight
+Hybrid: Weighted ensemble with optimized thresholds
+
+
+
+Requirements
+
+Python 3.8+
+TensorFlow 2.x, Scikit-learn, XGBoost
+NumPy, Pandas, SciPy, Matplotlib, Seaborn
+
+Usage
+
+Clone repository
+Install dependencies: pip install -r requirements.txt
+Run data extraction script
+Execute model training and evaluation
+
+Future Work
+
+Enhanced deep learning architectures (LSTM/GRU for temporal features)
+Transformer-based approaches for patient trajectory
+Develop model explainability components
+External validation on non-MIMIC datasets
+Clinical decision support interface
+
+License
+MIT License
