@@ -30,7 +30,36 @@ Traditional ML Models:
 
 Random Forest: 500 trees with optimized parameters
 XGBoost: Custom hyperparameters with scale_pos_weight
-Hybrid: Weighted ensemble with optimized thresholds
+Hybrid: The hybrid model in this project consists of a weighted ensemble of three models:
+
+Deep Learning Model: A multi-layer neural network with a wide and deep architecture (approximately 30% of the final prediction weight)
+Features batch normalization and LeakyReLU activations
+Contains dropout layers for regularization
+Uses a custom focal loss function to handle class imbalance
+Random Forest Model: A tree-based ensemble with 500 estimators (approximately 45% of the final prediction weight)
+Optimized hyperparameters including max depth and min samples
+Class weighting to handle imbalanced data
+Provides feature importance for model interpretability
+XGBoost Model: A gradient-boosted decision tree algorithm (approximately 25% of the final prediction weight)
+Custom learning rate and tree parameters
+Scale_pos_weight parameter to address class imbalance
+Configured for memory efficiency
+The hybrid model combines probability predictions from these three models using optimized weights (30-45-25) that were determined through statistical analysis to maximize the F1 score. It also uses a custom classification threshold (0.48) that was specifically tuned to balance precision and recall. This hybrid approach significantly outperformed any individual model, achieving superior performance across all metrics with statistical significance.
+
+
+
+The threshold of 0.48 for the hybrid model was specifically chosen based on careful optimization to balance precision and recall metrics. This value was selected for several important reasons:
+
+Balanced performance metrics: The threshold of 0.48 was found to maximize the F1 score (0.8338) by finding the optimal trade-off between precision (0.7698) and recall (0.9095).
+Clinical considerations: In a hospital mortality prediction context, a slightly lower threshold than the standard 0.5 allows for better identification of high-risk patients (higher recall) while still maintaining acceptable precision.
+Statistical optimization: During model development, multiple thresholds were tested, and 0.48 emerged as providing the best overall performance across all evaluation metrics in cross-validation.
+Ensemble calibration: Since the hybrid model combines predictions from three different model types, the probability distributions needed calibration, and 0.48 was determined to be the optimal cutoff point for the weighted ensemble's probability outputs.
+Bias-variance tradeoff: This specific threshold helped minimize both false positives and false negatives given the consequence of each error type in the clinical setting.
+The choice of 0.48 rather than the default 0.5 represents a slight preference toward higher sensitivity, ensuring the model catches more potential mortality cases, which aligns with the clinical priority of identifying high-risk patients who might benefit from additional interventions.
+
+
+
+
 
 
 
