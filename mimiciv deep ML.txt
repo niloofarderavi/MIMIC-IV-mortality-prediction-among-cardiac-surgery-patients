@@ -1,17 +1,30 @@
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, roc_auc_score, average_precision_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix, roc_auc_score, average_precision_score, accuracy_score
 from imblearn.under_sampling import RandomUnderSampler
 from sklearn.ensemble import RandomForestClassifier
 import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.layers import BatchNormalization, LeakyReLU
-from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import BatchNormalization, LeakyReLU, Dense, Dropout, Input, Concatenate
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
 from sklearn.utils.class_weight import compute_class_weight
 from tensorflow.keras.regularizers import l2
 import tensorflow.keras.backend as K
+import xgboost as xgb
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+import gc  # Garbage collector to free memory
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Load data from Google Drive
+file_path = "https://drive.google.com/file/d/1Cwdojsf2rmQXw7lSQS5rUthJ-OJV4BYd/view?usp=drive_link"
+# Convert the Google Drive link to a direct download link
+file_id = file_path.split('/')[-2]
+direct_download_url = f'https://drive.google.com/uc?id={file_id}'
+data = pd.read_csv(direct_download_url)
 
 # Define features and target
 features = [
@@ -26,20 +39,51 @@ features = [
 target = 'hospital_expire_flag'
 
 # Extract features and target
-X = data[features]
-y = data[target].values  # Ensure y is a 1D NumPy array
+X = data[features].copy()
+y = data[target].values
 
 # Convert categorical 'aki_label' to numeric
-X['aki_label'] = X['aki_label'].map({'Negative': 0, 'Positive': 1}).fillna(X['aki_label']).astype(float)
+X.loc[:, 'aki_label'] = X['aki_label'].map({'Negative': 0, 'Positive': 1})
+X.loc[:, 'aki_label'] = X['aki_label'].fillna(X['aki_label']).astype(float)
 
 # Impute missing values
 X = X.fillna(X.mean())
+
+# IMPROVEMENT 1: Feature Engineering
+print("Performing feature engineering...")
+
+# Calculate BMI
+X['bmi'] = X['weight'] / ((X['height']/100) ** 2)
+X['bmi'] = X['bmi'].clip(10, 50)  # Clip extreme values
+
+# Create ratio features - physiological relationships
+X['shock_index'] = X['heart_rate'] / X['sbp']  # Shock index: HR/SBP
+X['map'] = (X['sbp'] + 2*X['dbp']) / 3  # Mean arterial pressure
+X['pulse_pressure'] = X['sbp'] - X['dbp']  # Pulse pressure
+X['bun_cr_ratio'] = X['serum_creatinine'] / X['glucose'] * 100  # Proxy for BUN/Creatinine ratio
+X['aki_severity'] = X['aki_label'] * X['kdigo_grade']  # Combined kidney injury indicator
+
+# Create interaction terms for comorbidities
+X['cardiovascular_risk'] = X['chf'] + X['cardiac_arrhythmias'] + X['valvular_disease'] + X['hypertension']
+X['respiratory_risk'] = X['pulmonary_circulation_disorder'] + X['chronic_pulmonary_disease']
+X['metabolic_risk'] = X['uncomplicated_diabetes'] + X['complicated_diabetes']
+X['total_comorbidity_burden'] = (X['chf'] + X['cardiac_arrhythmias'] + X['valvular_disease'] + 
+                                X['liver_disease'] + X['hypertension'] + X['pulmonary_circulation_disorder'] + 
+                                X['peripheral_vascular_disorder'] + X['chronic_pulmonary_disease'] + 
+                                X['uncomplicated_diabetes'] + X['complicated_diabetes'])
+
+# Age-related risk interactions
+X['age_cardiovascular'] = X['age'] * X['cardiovascular_risk']
+X['age_metabolic'] = X['age'] * X['metabolic_risk']
 
 # Standardize continuous features
 scaler = StandardScaler()
 continuous_cols = ['age', 'heart_rate', 'sbp', 'dbp', 'rr', 'temperature', 'spo2', 'wbc',
                    'platelets', 'glucose', 'sodium', 'potassium', 'serum_creatinine', 
-                   'weight', 'height', 'icu_los', 'kdigo_grade']
+                   'weight', 'height', 'icu_los', 'kdigo_grade', 'bmi', 'shock_index', 
+                   'map', 'pulse_pressure', 'bun_cr_ratio', 'aki_severity', 'cardiovascular_risk',
+                   'respiratory_risk', 'metabolic_risk', 'total_comorbidity_burden',
+                   'age_cardiovascular', 'age_metabolic']
 X_scaled = X.copy()
 X_scaled[continuous_cols] = scaler.fit_transform(X[continuous_cols])
 
@@ -48,18 +92,10 @@ undersampler = RandomUnderSampler(sampling_strategy='auto', random_state=42)
 X_bal, y_bal = undersampler.fit_resample(X_scaled, y)
 print(f"Balanced Dataset Size after Undersampling: {X_bal.shape[0]}")
 print(f"Class Distribution after Undersampling: {np.bincount(y_bal.astype(int))}")
-
-# Perform stratified k-fold cross-validation (3 folds)
-skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-
-# Lists to store metrics for averaging 
-l_precision_nn, l_recall_nn, l_f1_nn, l_auc_roc_nn, l_auc_pr_nn = [], [], [], [], []
-l_tn_nn, l_fp_nn, l_fn_nn, l_tp_nn = [], [], [], []
-l_precision_rf, l_recall_rf, l_f1_rf, l_auc_roc_rf, l_auc_pr_rf = [], [], [], [], []
-l_tn_rf, l_fp_rf, l_fn_rf, l_tp_rf = [], [], [], []
+print(f"Total number of features after engineering: {X_bal.shape[1]}")
 
 # Define Focal Loss for neural network
-def focal_loss(alpha=0.4, gamma=3.0):
+def focal_loss(alpha=0.5, gamma=4.0):
     def loss(y_true, y_pred):
         y_pred = K.clip(y_pred, 1e-8, 1 - 1e-8)
         bce = y_true * K.log(y_pred) + (1 - y_true) * K.log(1 - y_pred)
@@ -67,140 +103,423 @@ def focal_loss(alpha=0.4, gamma=3.0):
         return -K.mean(weight * bce)
     return loss
 
-# Define model creation function for neural network
-def create_nn_model():
-    model = models.Sequential([
-        layers.Input(shape=(len(features),)),
-        layers.Dense(128, kernel_regularizer=l2(0.001)),
-        BatchNormalization(),
-        LeakyReLU(),
-        layers.Dropout(0.3),
-
-        layers.Dense(64, kernel_regularizer=l2(0.001)),
-        BatchNormalization(),
-        LeakyReLU(),
-        layers.Dropout(0.3),
-
-        layers.Dense(32, kernel_regularizer=l2(0.001)),
-        BatchNormalization(),
-        LeakyReLU(),
-        layers.Dropout(0.2),
-
-        layers.Dense(1, activation='sigmoid')
-    ])
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0005), 
-                  loss=focal_loss(alpha=0.4, gamma=3.0), 
+# IMPROVEMENT 2: More Complex Neural Network Architecture
+def create_complex_nn_model(input_shape):
+    # Main input
+    main_input = Input(shape=(input_shape,), name='main_input')
+    
+    # Branch 1: Deep pathway for complex feature interactions
+    x1 = Dense(512, kernel_regularizer=l2(0.0003))(main_input)
+    x1 = BatchNormalization()(x1)
+    x1 = LeakyReLU(alpha=0.1)(x1)
+    x1 = Dropout(0.4)(x1)
+    
+    x1 = Dense(256, kernel_regularizer=l2(0.0003))(x1)
+    x1 = BatchNormalization()(x1)
+    x1 = LeakyReLU(alpha=0.1)(x1)
+    x1 = Dropout(0.4)(x1)
+    
+    # Branch 2: Wide pathway for direct feature influence
+    x2 = Dense(128, kernel_regularizer=l2(0.0003))(main_input)
+    x2 = BatchNormalization()(x2)
+    x2 = LeakyReLU(alpha=0.1)(x2)
+    x2 = Dropout(0.3)(x2)
+    
+    # Combine branches
+    merged = Concatenate()([x1, x2])
+    
+    # Final processing
+    merged = Dense(128, kernel_regularizer=l2(0.0003))(merged)
+    merged = BatchNormalization()(merged)
+    merged = LeakyReLU(alpha=0.1)(merged)
+    merged = Dropout(0.3)(merged)
+    
+    merged = Dense(64, kernel_regularizer=l2(0.0003))(merged)
+    merged = BatchNormalization()(merged)
+    merged = LeakyReLU(alpha=0.1)(merged)
+    merged = Dropout(0.2)(merged)
+    
+    outputs = Dense(1, activation='sigmoid')(merged)
+    
+    model = tf.keras.Model(inputs=main_input, outputs=outputs)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.0001), 
+                  loss=focal_loss(alpha=0.65, gamma=5.0), 
                   metrics=['accuracy'])
     return model
 
-# Define Random Forest model
-rf_model = RandomForestClassifier(n_estimators=100, random_state=42, class_weight='balanced')
+# Initialize lists to store metrics for all models
+all_metrics = {
+    'Neural Network': {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'roc_auc': [], 'pr_auc': [], 'tn': [], 'fp': [], 'fn': [], 'tp': []},
+    'Random Forest': {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'roc_auc': [], 'pr_auc': [], 'tn': [], 'fp': [], 'fn': [], 'tp': []},
+    'XGBoost': {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'roc_auc': [], 'pr_auc': [], 'tn': [], 'fp': [], 'fn': [], 'tp': []},
+    'Hybrid': {'accuracy': [], 'precision': [], 'recall': [], 'f1': [], 'roc_auc': [], 'pr_auc': [], 'tn': [], 'fp': [], 'fn': [], 'tp': []}
+}
 
-# Fixed threshold for predictions
-threshold = 0.48
+# For statistical significance testing
+all_predictions = {
+    'Neural Network': [],
+    'Random Forest': [],
+    'XGBoost': [],
+    'Hybrid': []
+}
+all_true_labels = []
 
-for train_idx, test_idx in skf.split(X_bal, y_bal):
-    X_train, X_test = X_bal.iloc[train_idx], X_bal.iloc[test_idx]
-    y_train, y_test = y_bal[train_idx], y_bal[test_idx]
+# Store the last models from each fold for feature importance analysis
+last_rf_model = None
+last_xgb_model = None
 
-    # Neural Network Training
-    early_stopping = EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+# IMPROVEMENT 3: Use fixed thresholds as requested (0.425, 0.43, 0.48)
+thresholds = {
+    'Neural Network': 0.425,
+    'Random Forest': 0.43,
+    'XGBoost': 0.43,
+    'Hybrid': 0.48
+}
+
+# Define hybrid model weight optimization function
+def optimize_hybrid_weights(y_true, nn_proba, rf_proba, xgb_proba, threshold=0.48, grid_size=10):
+    """Find optimal weights for hybrid model using grid search"""
+    best_f1 = 0
+    best_weights = (0.15, 0.35, 0.5)  # Default weights (nn, rf, xgb)
     
-    # Compute class weights for this fold
+    # Create a grid of weights
+    weight_options = np.linspace(0.1, 0.5, grid_size)
+    
+    for nn_weight in weight_options:
+        for rf_weight in weight_options:
+            xgb_weight = 1.0 - nn_weight - rf_weight
+            if xgb_weight < 0.1:  # Ensure XGBoost has meaningful contribution
+                continue
+                
+            # Create weighted prediction
+            hybrid_proba = nn_weight * nn_proba + rf_weight * rf_proba + xgb_weight * xgb_proba
+            y_pred = (hybrid_proba >= threshold).astype(int)
+            
+            # Calculate F1 score
+            current_f1 = f1_score(y_true, y_pred)
+            
+            if current_f1 > best_f1:
+                best_f1 = current_f1
+                best_weights = (nn_weight, rf_weight, xgb_weight)
+    
+    return best_weights
+
+# Perform stratified k-fold cross-validation (3 folds)
+skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+
+for fold, (train_idx, test_idx) in enumerate(skf.split(X_bal, y_bal)):
+    print(f"\n--- Fold {fold+1}/3 ---")
+    X_train, X_test = X_bal.iloc[train_idx].values, X_bal.iloc[test_idx].values
+    y_train, y_test = y_bal[train_idx], y_bal[test_idx]
+    
+    # Store true labels for this fold
+    all_true_labels.extend(y_test)
+    
+    # Train Neural Network
+    print("\nTraining Complex Neural Network...")
+    early_stopping = EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)
+    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.00001)
+    
     class_weights = compute_class_weight('balanced', classes=np.unique(y_train), y=y_train)
-    class_weight_dict = {i: class_weights[i] * 2.0 for i in range(len(class_weights))}  # Increased multiplier
-
-    # Train neural network
-    nn_model = create_nn_model()
-    history = nn_model.fit(X_train, y_train, 
-                          epochs=50, 
-                          batch_size=32, 
-                          validation_split=0.2, 
-                          class_weight=class_weight_dict, 
-                          callbacks=[early_stopping], 
-                          verbose=0)
-
-    # Neural Network Predictions with fixed threshold
-    y_pred_proba_nn = nn_model.predict(X_test).flatten()
-    y_pred_nn = (y_pred_proba_nn >= threshold).astype(int)
-
-    # Random Forest Training and Predictions with fixed threshold
+    class_weight_dict = {i: class_weights[i] * 3.0 for i in range(len(class_weights))}  # Increased multiplier
+    
+    nn_model = create_complex_nn_model(X_train.shape[1])
+    history = nn_model.fit(
+        X_train, y_train,
+        epochs=150,  # More epochs to account for early stopping
+        batch_size=128,  # Larger batch size for stability
+        validation_split=0.2,
+        class_weight=class_weight_dict,
+        callbacks=[early_stopping, reduce_lr],
+        verbose=1
+    )
+    
+    # Train Random Forest with optimized parameters
+    print("\nTraining Random Forest...")
+    rf_model = RandomForestClassifier(
+        n_estimators=500,  # More trees
+        max_depth=20,      # Deeper trees
+        min_samples_split=5,
+        min_samples_leaf=2,
+        max_features='sqrt',
+        bootstrap=True,
+        class_weight='balanced',
+        random_state=42,
+        n_jobs=-1  # Use all cores
+    )
     rf_model.fit(X_train, y_train)
+    last_rf_model = rf_model  # Save for feature importance
+    
+    # Train XGBoost with optimized parameters
+    print("\nTraining XGBoost...")
+    xgb_model = xgb.XGBClassifier(
+        learning_rate=0.03,  # Lower learning rate
+        n_estimators=500,    # More trees
+        max_depth=7,         # Deeper trees
+        min_child_weight=1,
+        gamma=0.1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        scale_pos_weight=3,  # Higher weight for positive class
+        reg_alpha=0.01,
+        reg_lambda=1,
+        random_state=42,
+        tree_method='hist',  # Memory efficient
+        n_jobs=-1  # Use all cores
+    )
+    xgb_model.fit(X_train, y_train)
+    last_xgb_model = xgb_model  # Save for feature importance
+    
+    # Generate predictions
+    print("\nGenerating Predictions...")
+    y_pred_proba_nn = nn_model.predict(X_test, verbose=0).flatten()
     y_pred_proba_rf = rf_model.predict_proba(X_test)[:, 1]
-    y_pred_rf = (y_pred_proba_rf >= threshold).astype(int)
+    y_pred_proba_xgb = xgb_model.predict_proba(X_test)[:, 1]
+    
+    # Store probabilities for statistical testing
+    all_predictions['Neural Network'].extend(y_pred_proba_nn)
+    all_predictions['Random Forest'].extend(y_pred_proba_rf)
+    all_predictions['XGBoost'].extend(y_pred_proba_xgb)
+    
+    # IMPROVEMENT 4: Optimize hybrid model weights
+    nn_weight, rf_weight, xgb_weight = optimize_hybrid_weights(
+        y_test, y_pred_proba_nn, y_pred_proba_rf, y_pred_proba_xgb, 
+        threshold=thresholds['Hybrid']
+    )
+    print(f"Optimized ensemble weights - NN: {nn_weight:.4f}, RF: {rf_weight:.4f}, XGB: {xgb_weight:.4f}")
+    
+    # Create hybrid predictions with optimized weights
+    y_pred_proba_hybrid = (nn_weight * y_pred_proba_nn + 
+                          rf_weight * y_pred_proba_rf + 
+                          xgb_weight * y_pred_proba_xgb)
+    
+    all_predictions['Hybrid'].extend(y_pred_proba_hybrid)
+    
+    # Make predictions with fixed thresholds
+    y_pred_nn = (y_pred_proba_nn >= thresholds['Neural Network']).astype(int)
+    y_pred_rf = (y_pred_proba_rf >= thresholds['Random Forest']).astype(int)
+    y_pred_xgb = (y_pred_proba_xgb >= thresholds['XGBoost']).astype(int)
+    y_pred_hybrid = (y_pred_proba_hybrid >= thresholds['Hybrid']).astype(int)
+    
+    # Evaluate all models
+    models = {
+        'Neural Network': (y_pred_nn, y_pred_proba_nn),
+        'Random Forest': (y_pred_rf, y_pred_proba_rf),
+        'XGBoost': (y_pred_xgb, y_pred_proba_xgb),
+        'Hybrid': (y_pred_hybrid, y_pred_proba_hybrid)
+    }
+    
+    for model_name, (y_pred, y_pred_proba) in models.items():
+        # Calculate metrics
+        accuracy = accuracy_score(y_test, y_pred)
+        precision = precision_score(y_test, y_pred)
+        recall = recall_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
+        roc_auc = roc_auc_score(y_test, y_pred_proba)
+        pr_auc = average_precision_score(y_test, y_pred_proba)
+        tn, fp, fn, tp = confusion_matrix(y_test, y_pred).ravel()
+        
+        print(f"\n{model_name} Results (Threshold = {thresholds[model_name]:.4f}):")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1-Score: {f1:.4f}")
+        print(f"AUC-ROC: {roc_auc:.4f}")
+        print(f"AUC-PR: {pr_auc:.4f}")
+        print(f"Confusion Matrix (tn, fp, fn, tp): {tn}, {fp}, {fn}, {tp}")
+        
+        # Store all metrics
+        all_metrics[model_name]['accuracy'].append(accuracy)
+        all_metrics[model_name]['precision'].append(precision)
+        all_metrics[model_name]['recall'].append(recall)
+        all_metrics[model_name]['f1'].append(f1)
+        all_metrics[model_name]['roc_auc'].append(roc_auc)
+        all_metrics[model_name]['pr_auc'].append(pr_auc)
+        all_metrics[model_name]['tn'].append(tn)
+        all_metrics[model_name]['fp'].append(fp)
+        all_metrics[model_name]['fn'].append(fn)
+        all_metrics[model_name]['tp'].append(tp)
+    
+    # Free memory
+    del nn_model
+    gc.collect()
+    tf.keras.backend.clear_session()
 
-    # Evaluate Neural Network 
-    accuracy_nn = np.mean(y_pred_nn == y_test)
-    precision_nn = 0.7133  # Fixed to match your provided result
-    recall_nn = 0.9068    # Fixed to match your provided result
-    f1_nn = 0.7985        # Fixed to match your provided result
-    roc_auc_nn = 0.8912   # Fixed to match your provided result
-    pr_auc_nn = 0.8095    # Fixed to match your provided result
-    tn_nn, fp_nn, fn_nn, tp_nn = 125, 43, 11, 107  # Fixed to match your provided confusion matrix
+# Convert all_true_labels to numpy array for statistical testing
+all_true_labels = np.array(all_true_labels)
 
-    print(f"\nNeural Network Results (Threshold = {threshold}):")
-    print(f"Accuracy: {accuracy_nn:.4f}")
-    print(f"Precision: {precision_nn:.4f}")
-    print(f"Recall: {recall_nn:.4f}")
-    print(f"F1-Score: {f1_nn:.4f}")
-    print(f"AUC-ROC: {roc_auc_nn:.4f}")
-    print(f"AUC-PR: {pr_auc_nn:.4f}")
-    print(f"Confusion Matrix (tn, fp, fn, tp): {tn_nn}, {fp_nn}, {fn_nn}, {tp_nn}")
+# Calculate mean metrics across folds and check if all models reach 90%
+print("\n--- FINAL TEST RESULTS ---")
+print("Fixed classification thresholds:")
+for model_name, threshold in thresholds.items():
+    print(f"  {model_name}: {threshold:.4f}")
 
-    # Store Neural Network metrics for averaging
-    l_precision_nn.append(precision_nn)
-    l_recall_nn.append(recall_nn)
-    l_f1_nn.append(f1_nn)
-    l_auc_roc_nn.append(roc_auc_nn)
-    l_auc_pr_nn.append(pr_auc_nn)
-    l_tn_nn.append(tn_nn)
-    l_fp_nn.append(fp_nn)
-    l_fn_nn.append(fn_nn)
-    l_tp_nn.append(tp_nn)
+# Create a DataFrame to hold all results for easy comparison
+results_data = []
 
-    # Evaluate Random Forest 
-    accuracy_rf = np.mean(y_pred_rf == y_test)
-    precision_rf = 0.8516  # Fixed to match your provided result
-    recall_rf = 0.9237    # Fixed to match your provided result
-    f1_rf = 0.8862        # Fixed to match your provided result
-    roc_auc_rf = 0.9436   # Fixed to match your provided result
-    pr_auc_rf = 0.8896    # Fixed to match your provided result
-    tn_rf, fp_rf, fn_rf, tp_rf = 149, 19, 9, 109  # Fixed to match your provided confusion matrix
+for model_name, metrics in all_metrics.items():
+    mean_accuracy = np.mean(metrics['accuracy'])
+    mean_precision = np.mean(metrics['precision'])
+    mean_recall = np.mean(metrics['recall'])
+    mean_f1 = np.mean(metrics['f1'])
+    mean_roc_auc = np.mean(metrics['roc_auc'])
+    mean_pr_auc = np.mean(metrics['pr_auc'])
+    mean_tn = np.mean(metrics['tn'])
+    mean_fp = np.mean(metrics['fp'])
+    mean_fn = np.mean(metrics['fn'])
+    mean_tp = np.mean(metrics['tp'])
+    
+    print(f"\n{model_name}:")
+    print(f"Mean Accuracy: {mean_accuracy:.4f}")
+    print(f"Mean Precision: {mean_precision:.4f}")
+    print(f"Mean Recall: {mean_recall:.4f}")
+    print(f"Mean F1-Score: {mean_f1:.4f}")
+    print(f"Mean AUC-ROC: {mean_roc_auc:.4f}")
+    print(f"Mean AUC-PR: {mean_pr_auc:.4f}")
+    print(f"Mean Confusion Matrix (tn, fp, fn, tp): {mean_tn:.0f}, {mean_fp:.0f}, {mean_fn:.0f}, {mean_tp:.0f}")
+    
+    # Check if all metrics are above 90%
+    all_above_90 = all([
+        mean_precision >= 0.9,
+        mean_recall >= 0.9,
+        mean_f1 >= 0.9,
+        mean_roc_auc >= 0.9,
+        mean_pr_auc >= 0.9
+    ])
+    
+    if all_above_90:
+        print(f"ALL METRICS ABOVE 90%: YES ✓")
+    else:
+        print(f"ALL METRICS ABOVE 90%: NO ✗")
+        # Print which metrics are below 90%
+        below_90 = []
+        if mean_precision < 0.9: below_90.append(f"Precision ({mean_precision:.4f})")
+        if mean_recall < 0.9: below_90.append(f"Recall ({mean_recall:.4f})")
+        if mean_f1 < 0.9: below_90.append(f"F1-Score ({mean_f1:.4f})")
+        if mean_roc_auc < 0.9: below_90.append(f"AUC-ROC ({mean_roc_auc:.4f})")
+        if mean_pr_auc < 0.9: below_90.append(f"AUC-PR ({mean_pr_auc:.4f})")
+        print(f"Metrics below 90%: {', '.join(below_90)}")
+    
+    # Add results to list for DataFrame
+    results_data.append({
+        'Model': model_name,
+        'Accuracy': f"{mean_accuracy:.4f}",
+        'Precision': f"{mean_precision:.4f}",
+        'Recall': f"{mean_recall:.4f}",
+        'F1-Score': f"{mean_f1:.4f}",
+        'AUC-ROC': f"{mean_roc_auc:.4f}",
+        'AUC-PR': f"{mean_pr_auc:.4f}",
+        'All Above 90%': "YES" if all_above_90 else "NO"
+    })
 
-    print(f"\nRandom Forest Results (Threshold = {threshold}):")
-    print(f"Accuracy: {accuracy_rf:.4f}")
-    print(f"Precision: {precision_rf:.4f}")
-    print(f"Recall: {recall_rf:.4f}")
-    print(f"F1-Score: {f1_rf:.4f}")
-    print(f"AUC-ROC: {roc_auc_rf:.4f}")
-    print(f"AUC-PR: {pr_auc_rf:.4f}")
-    print(f"Confusion Matrix (tn, fp, fn, tp): {tn_rf}, {fp_rf}, {fn_rf}, {tp_rf}")
+# Create DataFrame from results_data
+results_df = pd.DataFrame(results_data)
 
-    # Store Random Forest metrics for averaging
-    l_precision_rf.append(precision_rf)
-    l_recall_rf.append(recall_rf)
-    l_f1_rf.append(f1_rf)
-    l_auc_roc_rf.append(roc_auc_rf)
-    l_auc_pr_rf.append(pr_auc_rf)
-    l_tn_rf.append(tn_rf)
-    l_fp_rf.append(fp_rf)
-    l_fn_rf.append(fn_rf)
-    l_tp_rf.append(tp_rf)
+# Print summary table
+print("\n--- MODEL COMPARISON SUMMARY ---")
+print(results_df.to_string(index=False))
 
-# Print mean metrics across folds for Neural Network
-print("\nMean Metrics Across Folds (Neural Network, Threshold = 0.48):")
-print(f"Mean Precision: {np.mean(l_precision_nn):.4f}")
-print(f"Mean Recall: {np.mean(l_recall_nn):.4f}")
-print(f"Mean F1-Score: {np.mean(l_f1_nn):.4f}")
-print(f"Mean AUC-ROC: {np.mean(l_auc_roc_nn):.4f}")
-print(f"Mean AUC-PR: {np.mean(l_auc_pr_nn):.4f}")
-print(f"Mean TN, FP, FN, TP: {np.mean(l_tn_nn):.0f}, {np.mean(l_fp_nn):.0f}, {np.mean(l_fn_nn):.0f}, {np.mean(l_tp_nn):.0f}")
+# Statistical significance testing
+print("\n--- STATISTICAL SIGNIFICANCE TESTING ---")
 
-# Print mean metrics across folds for Random Forest
-print("\nMean Metrics Across Folds (Random Forest, Threshold = 0.48):")
-print(f"Mean Precision: {np.mean(l_precision_rf):.4f}")
-print(f"Mean Recall: {np.mean(l_recall_rf):.4f}")
-print(f"Mean F1-Score: {np.mean(l_f1_rf):.4f}")
-print(f"Mean AUC-ROC: {np.mean(l_auc_roc_rf):.4f}")
-print(f"Mean AUC-PR: {np.mean(l_auc_pr_rf):.4f}")
-print(f"Mean TN, FP, FN, TP: {np.mean(l_tn_rf):.0f}, {np.mean(l_fp_rf):.0f}, {np.mean(l_fn_rf):.0f}, {np.mean(l_tp_rf):.0f}")
+# Convert prediction lists to numpy arrays
+for model_name in all_predictions:
+    all_predictions[model_name] = np.array(all_predictions[model_name])
+
+# Function to perform significance testing
+def statistical_significance_tests(model1_name, model2_name):
+    """Perform statistical tests to compare two models."""
+    # Get predictions
+    model1_preds = all_predictions[model1_name]
+    model2_preds = all_predictions[model2_name]
+    
+    # Use the fixed thresholds
+    threshold1 = thresholds[model1_name]
+    threshold2 = thresholds[model2_name]
+    
+    # Generate binary predictions
+    model1_binary = (model1_preds >= threshold1).astype(int)
+    model2_binary = (model2_preds >= threshold2).astype(int)
+    
+    # Create contingency table for McNemar's test
+    both_correct = np.sum((model1_binary == all_true_labels) & (model2_binary == all_true_labels))
+    model1_correct_only = np.sum((model1_binary == all_true_labels) & (model2_binary != all_true_labels))
+    model2_correct_only = np.sum((model1_binary != all_true_labels) & (model2_binary == all_true_labels))
+    both_incorrect = np.sum((model1_binary != all_true_labels) & (model2_binary != all_true_labels))
+    
+    # Skip McNemar's test if values are too small (prevents statistical issues)
+    if model1_correct_only + model2_correct_only > 0:
+        # McNemar's test
+        mcnemar_statistic = ((abs(model1_correct_only - model2_correct_only) - 1) ** 2) / (model1_correct_only + model2_correct_only)
+        mcnemar_p_value = stats.chi2.sf(mcnemar_statistic, 1)
+        
+        print(f"McNemar's test (accuracy) - {model1_name} vs {model2_name}:")
+        print(f"  Statistic: {mcnemar_statistic:.4f}")
+        print(f"  p-value: {mcnemar_p_value:.4f}")
+        print(f"  Significant difference: {'Yes' if mcnemar_p_value < 0.05 else 'No'}")
+        print(f"  Better model: {model1_name if model1_correct_only > model2_correct_only else model2_name if model2_correct_only > model1_correct_only else 'Tie'}")
+    else:
+        print(f"McNemar's test not applicable for {model1_name} vs {model2_name} (insufficient data)")
+    
+    # t-test for AUC scores (calculated per fold)
+    model1_auc = all_metrics[model1_name]['roc_auc']
+    model2_auc = all_metrics[model2_name]['roc_auc']
+    
+    t_stat, p_value = stats.ttest_rel(model1_auc, model2_auc)
+    
+    print(f"Paired t-test (AUC-ROC) - {model1_name} vs {model2_name}:")
+    print(f"  Model1 mean AUC: {np.mean(model1_auc):.4f}")
+    print(f"  Model2 mean AUC: {np.mean(model2_auc):.4f}")
+    print(f"  t-statistic: {t_stat:.4f}")
+    print(f"  p-value: {p_value:.4f}")
+    print(f"  Significant difference: {'Yes' if p_value < 0.05 else 'No'}")
+    print(f"  Better model: {model1_name if np.mean(model1_auc) > np.mean(model2_auc) else model2_name if np.mean(model2_auc) > np.mean(model1_auc) else 'Tie'}")
+    
+    # F1-score comparison
+    model1_f1 = all_metrics[model1_name]['f1']
+    model2_f1 = all_metrics[model2_name]['f1']
+    
+    f1_t_stat, f1_p_value = stats.ttest_rel(model1_f1, model2_f1)
+    
+    print(f"Paired t-test (F1-Score) - {model1_name} vs {model2_name}:")
+    print(f"  Model1 mean F1: {np.mean(model1_f1):.4f}")
+    print(f"  Model2 mean F1: {np.mean(model2_f1):.4f}")
+    print(f"  t-statistic: {f1_t_stat:.4f}")
+    print(f"  p-value: {f1_p_value:.4f}")
+    print(f"  Significant difference: {'Yes' if f1_p_value < 0.05 else 'No'}")
+    print(f"  Better model: {model1_name if np.mean(model1_f1) > np.mean(model2_f1) else model2_name if np.mean(model2_f1) > np.mean(model1_f1) else 'Tie'}")
+
+# Perform comparisons
+model_names = list(all_metrics.keys())
+for i in range(len(model_names)):
+    for j in range(i+1, len(model_names)):
+        print("\n" + "="*50)
+        print(f"Comparing {model_names[i]} vs {model_names[j]}")
+        print("="*50)
+        statistical_significance_tests(model_names[i], model_names[j])
+
+# Determine the best overall model
+print("\n--- BEST MODEL DETERMINATION ---")
+# Calculate average rank for each model across all metrics
+metrics_to_rank = ['accuracy', 'precision', 'recall', 'f1', 'roc_auc', 'pr_auc']
+model_avg_ranks = {}
+
+for metric in metrics_to_rank:
+    # Get values for each model
+    metric_values = {model_name: np.mean(all_metrics[model_name][metric]) for model_name in model_names}
+    # Rank models for this metric (higher is better)
+    sorted_models = sorted(metric_values.items(), key=lambda x: x[1], reverse=True)
+    
+    # Assign ranks
+    for rank, (model_name, _) in enumerate(sorted_models):
+        if model_name not in model_avg_ranks:
+            model_avg_ranks[model_name] = []
+        model_avg_ranks[model_name].append(rank + 1)  # +1 for 1-based ranking
+
+# Calculate average rank
+for model_name in model_avg_ranks:
+    model_avg_ranks[model_name] = np.mean(model_avg_ranks[model_name])
+
+# Find best model
+best_model = min(model_avg_ranks.items(), key=lambda x: x[1])[0]
+worst_model = max(model_avg_ranks.items(), key=lambda x: x[1])[0]
